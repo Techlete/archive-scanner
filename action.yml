@@ -1,0 +1,91 @@
+name: 'PR Archive Inspector'
+description: 'Inspects archives in PRs, lists contents, calculates checksums, and comments on the PR.'
+inputs:
+  github-token:
+    description: 'GitHub token for commenting on PRs.'
+    required: true
+  fail-if-not-pr:
+    description: Should we fail this action if this is not a PR?
+    default: 'false'
+    required: false
+outputs:
+  archive-details:
+    description: 'JSON-formatted details of the archives inspected, including file names and checksums.'
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify PR context
+      if: ${{ github.event_name != 'pull_request' && inputs.fail-if-not-pr == 'true' }}
+      shell: bash
+      run: |
+        echo "Error: This action must be run in the context of a pull request."
+        exit 1
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Install necessary tools
+      if: ${{ github.event_name == 'pull_request' }}
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq unzip unrar tar coreutils
+
+    - name: Find Archive Files
+      id: find-archives
+      shell: bash
+      run: |
+        archives=$(find . -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.rar" \) | jq -R -s -c 'split("\n")[:-1]')
+        echo "archives=$archives" >> $GITHUB_OUTPUT
+
+    - name: Extract and Calculate Checksums
+      if: ${{ steps.find-archives.outputs.archives != '' }}
+      id: extract-checksums
+      shell: bash
+      run: |
+        json_array="[]"
+        comments=""
+        echo '${{ steps.find-archives.outputs.archives }}' | jq -c -r '.[]' | while IFS= read archive
+        do
+          if [[ "$archive" == *.zip ]]; then
+            filenames=$(unzip -l "$archive" | awk '{print $4}' | sed '/^$/d' | jq -R -s 'split("\n") | map(select(. != ""))')
+          elif [[ "$archive" == *.tar.gz ]]; then
+            filenames=$(tar -tzf "$archive" | jq -R -s 'split("\n") | map(select(. != ""))')
+          elif [[ "$archive" == *.rar ]]; then
+            filenames=$(unrar lb "$archive" | jq -R -s 'split("\n") | map(select(. != ""))')
+          fi
+          
+          comment_detail="<details><summary>Contents of ${archive}</summary>\n\n\`\`\`"
+          echo $filenames | jq -c -r '.[]' | while IFS= read file
+          do
+            if [[ "$archive" == *.zip ]]; then
+              checksum=$(unzip -p "$archive" "$file" | sha512sum | awk '{print $1}')
+            elif [[ "$archive" == *.tar.gz ]]; then
+              checksum=$(tar -Oxzvf "$archive" "$file" | sha512sum | awk '{print $1}')
+            elif [[ "$archive" == *.rar ]]; then
+              checksum=$(unrar p -inul "$archive" "$file" | sha512sum | awk '{print $1}')
+            fi
+            comment_detail+="\n${file} - ${checksum}"
+            json_array=$(echo $json_array | jq -c --arg a "$archive" --arg f "$file" --arg c "$checksum" --arg actor "${{ github.actor }}" --arg actor_id "${{ github.actor_id }}" '. += [{"archive": $a, "file": $f, "checksum": $c, "actor": $actor, "actor_id": $actor_id}]')
+          done
+          comment_detail+="\n\n\`\`\`\n\n</details>"
+          comments+="${comment_detail}\n"
+        done
+
+        echo "archive_details=$json_array" >> $GITHUB_OUTPUT
+        echo "content=$comments" >> $GITHUB_OUTPUT
+
+    - name: Comment on PR
+      if: ${{ steps.extract-checksums.outputs.content != '' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const issue_number = context.issue.number;
+          const content = `${{ steps.extract-checksums.outputs.content }}`;
+          github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: issue_number,
+            body: content
+          });
